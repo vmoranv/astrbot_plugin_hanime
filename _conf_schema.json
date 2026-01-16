@@ -1,0 +1,18 @@
+{
+    "proxy": {
+        "description": "代理服务器地址，留空则不使用代理",
+        "type": "string",
+        "hint": "例如: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080",
+        "default": ""
+    },
+    "blur_level": {
+        "description": "缩略图/封面模糊程度 (0-100，0为不模糊)",
+        "type": "int",
+        "default": 70
+    },
+    "max_search_results": {
+        "description": "搜索结果最大显示数量",
+        "type": "int",
+        "default": 10
+    }
+}
