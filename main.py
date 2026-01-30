@@ -15,7 +15,7 @@ from astrbot.api import logger
 from .modules.client import HanimeClient
 from .modules.video import Video
 from .modules.utils import download_image, blur_image, save_image
-from .modules.consts import CATEGORIES
+from .modules.consts import CATEGORIES, TAGS
 
 
 def get_cache_dir() -> Path:
@@ -147,8 +147,10 @@ class HanimePlugin(Star):
             lines.append(f"🏷️ 标签: {', '.join(video.tags[:5])}")
         
         lines.extend(["", f"🔗 链接: {video.url}"])
+        if video.video_url:
+            lines.append(f"▶️ 直链: {video.video_url}")
         
-        return "\u200E\n".join(lines) + "\u200E"
+        return "\n\u200E".join(lines)
     
     @filter.command("hv")
     async def cmd_video_info(self, event: AstrMessageEvent, video_id: str = ""):
@@ -188,7 +190,7 @@ class HanimePlugin(Star):
             yield event.plain_result(f"❌ 获取视频信息失败: {str(e)}\u200E")
     
     @filter.command("hs")
-    async def cmd_search(self, event: AstrMessageEvent, *args):
+    async def cmd_search(self, event: AstrMessageEvent, args: str = ""):
         """
         搜索视频
         用法: /hs <关键词> [页码]
@@ -198,16 +200,17 @@ class HanimePlugin(Star):
             return
         
         # 解析参数
-        query_parts = []
         page = 1
+        query = ""
         
-        for arg in args:
-            if arg.isdigit():
-                page = int(arg)
-            else:
-                query_parts.append(arg)
-        
-        query = " ".join(query_parts)
+        # 逻辑：只有当参数超过1个，且最后一个参数是纯数字时，才把最后一个当页码
+        if len(args) > 1 and args[-1].isdigit():
+            page = int(args[-1])
+            # 关键词是除了最后一个之外的所有内容
+            query = " ".join(args[:-1])
+        else:
+            # 其他情况（只有一个参数，或者最后一个不是数字），全部当作关键词
+            query = " ".join(args)
         
         if not query:
             yield event.plain_result("❌ 请提供搜索关键词\u200E")
@@ -248,13 +251,13 @@ class HanimePlugin(Star):
     async def cmd_by_tag(self, event: AstrMessageEvent, tag: str = "", page: str = "1"):
         """
         按标签查询
-        用法: /htag <标签> [页码]
+        用法: /htag <标签1>, <标签2> [页码]
         """
         if not tag:
             # 显示可用标签
-            tags_text = "📂 可用标签:\n" + "\n".join(f"  • {cat}" for cat in CATEGORIES[:15])
-            if len(CATEGORIES) > 15:
-                tags_text += f"\n  ... 还有 {len(CATEGORIES) - 15} 个标签"
+            tags_text = "📂 可用标签:\n" + "\n".join(f"  • {cat}" for cat in TAGS[:15])
+            if len(TAGS) > 15:
+                tags_text += f"\n  ..."
             yield event.plain_result(tags_text + "\u200E")
             return
         
@@ -263,12 +266,14 @@ class HanimePlugin(Star):
         except ValueError:
             page_num = 1
         
+        raw_tag_input = tag.replace("，", ",")
+        tag_list = [t.strip() for t in raw_tag_input.split(",") if t.strip()]
         try:
             # 清理之前的缓存
             self._clean_previous_cache()
             
             # 按标签查询
-            results = await self.client.get_by_genre(tag, page=page_num, limit=self.max_search_results)
+            results = await self.client.get_by_tags(tag_list, page=page_num, limit=self.max_search_results)
             
             if not results:
                 yield event.plain_result(f"📭 未找到标签 \"{tag}\" 的视频\u200E")
@@ -293,7 +298,54 @@ class HanimePlugin(Star):
         except Exception as e:
             logger.error(f"[Hanime] 标签查询失败: {e}")
             yield event.plain_result(f"❌ 标签查询失败: {str(e)}\u200E")
-    
+
+    @filter.command("hgenre")
+    async def cmd_by_hgenre(self, event: AstrMessageEvent, genre: str = "", page: str = "1"):
+        """
+        按分类查询
+        用法: /hgenre <分类名> [页码]
+        """
+        if not genre:
+            # 显示可用分类
+            tags_text = "📂 可用分类 (Genre):\n" + "\n".join(f"  • {cat}" for cat in CATEGORIES[:15])
+            if len(CATEGORIES) > 15:
+                tags_text += f"\n  ... 还有 {len(CATEGORIES) - 15} 个分类"
+            yield event.plain_result(tags_text + "\n\n用法: /hgenre <分类名>\u200E")
+            return
+        
+        try:
+            page_num = int(page) if page.isdigit() else 1
+        except ValueError:
+            page_num = 1
+        
+        try:
+            # 清理之前的缓存
+            self._clean_previous_cache()
+            
+            # 按标签查询
+            results = await self.client.get_by_genre(genre, page=page_num, limit=self.max_search_results)
+            
+            if not results:
+                yield event.plain_result(f"📭 未找到分类 \"{genre}\" 的视频\u200E")
+                return
+            
+            lines = [
+                f"📂 分类搜索: {genre}",
+                f"📄 第 {page} 页",
+                ""
+            ]
+            
+            for i, item in enumerate(results[:self.max_search_results], 1):
+                title = item.title or f"视频 {item.video_id}"
+                lines.append(f"{i}. 【{item.video_id}】{title}")
+            
+            lines.extend(["", "💡 使用 /hv <ID> 查看详情"])
+            yield event.plain_result("\u200E\n".join(lines) + "\u200E")
+            
+        except Exception as e:
+            logger.error(f"[Hanime] 分类查询失败: {e}")
+            yield event.plain_result(f"❌ 分类查询失败: {str(e)}\u200E")
+
     @filter.command("hlatest")
     async def cmd_latest(self, event: AstrMessageEvent):
         """
@@ -410,7 +462,7 @@ class HanimePlugin(Star):
         用法: /hcategories
         """
         lines = [
-            "📂 所有分类/标签",
+            "📂 所有分类",
             ""
         ]
         
