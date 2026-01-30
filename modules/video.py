@@ -230,75 +230,173 @@ class Video:
         return ""
     
     def _extract_uploader(self) -> str:
-        """提取上传者"""
-        match = REGEX_UPLOADER.search(self._html_content)
+        """提取上传者 (针对 HTML 源码修正版)"""
+        if not self._html_content:
+            return "未知上传者"
+
+        # 1. 策略一：精准匹配 ID (最稳)
+        # 源码中: <a id="video-artist-name" ...> StarryMomoko </a>
+        # 使用 DOTALL 模式因为名字可能在标签的下一行
+        id_pattern = r'id="video-artist-name"[^>]*>(.*?)</a>'
+        match = re.search(id_pattern, self._html_content, re.DOTALL | re.IGNORECASE)
+        if match:
+            name = clean_html(match.group(1)).strip()
+            if name:
+                return name
+
+        # 2. 策略二：从标题中提取 (备选)
+        # 源码中: <h3 id="shareBtn-title" ...>[StarryMomoko] Ellen oral...</h3>
+        # 很多视频标题开头是 [作者名]
+        title_pattern = r'<h3\s+id="shareBtn-title"[^>]*>\s*\[([^\]]+)\]'
+        match = re.search(title_pattern, self._html_content, re.IGNORECASE)
+        if match:
+            name = clean_html(match.group(1)).strip()
+            # 排除一些非作者的标记
+            if name and "中文字幕" not in name and "無碼" not in name:
+                return name
+
+        # 3. 策略三：从 Meta Description 提取
+        # 源码中: Title / タイトル: ... Brand / ブランド: StarryMomoko
+        desc_pattern = r'(?:Brand|Circle|Artist)\s*/\s*(?:ブランド|サークル|作者)[^:]*:\s*([^\n<]+)'
+        match = re.search(desc_pattern, self._html_content, re.IGNORECASE)
         if match:
             return clean_html(match.group(1)).strip()
-        
-        match = REGEX_UPLOADER_ALT.search(self._html_content)
-        if match:
-            return clean_html(match.group(1)).strip()
-        
-        # 尝试其他模式
-        patterns = [
-            r'上傳者[：:]\s*<[^>]*>([^<]+)<',
-            r'<a[^>]+href="/creator/[^"]*"[^>]*>([^<]+)</a>',
-            r'class="[^"]*uploader[^"]*"[^>]*>([^<]+)<',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, self._html_content, re.IGNORECASE)
-            if match:
-                return clean_html(match.group(1)).strip()
-        
-        return ""
+
+        return "未知上传者"
+
+
     
     def _extract_tags(self) -> List[str]:
-        """提取标签"""
+        """提取标签 (最终修正版：基于 single-video-tag 类提取)"""
         tags = set()
         
-        # 使用主正则
-        for match in REGEX_TAGS.finditer(self._html_content):
-            tag = clean_html(match.group(2)).strip()
-            if tag and len(tag) < 50:
+        if not self._html_content:
+            return []
+
+        # 1. 策略一：Meta 标签 (依旧保留，作为最稳的备选)
+        meta_pattern = r'<meta\s+property="article:tag"\s+content="([^"]+)"'
+        for match in re.finditer(meta_pattern, self._html_content, re.IGNORECASE):
+            tag = clean_html(match.group(1)).strip()
+            if tag:
                 tags.add(tag)
+
+        # 2. 策略二：基于 class="single-video-tag" 提取 (针对你提供的 HTML 结构)
+        # 这种方法最准，因为它专门定位标签区域，绝对不会抓到导航栏
         
-        # 如果没找到，尝试其他模式
-        if not tags:
-            # 匹配 href="/search?genre=xxx" 模式
-            genre_pattern = r'<a[^>]+href="/search\?genre=([^"&]+)"[^>]*>([^<]*)</a>'
-            for match in re.finditer(genre_pattern, self._html_content, re.IGNORECASE):
-                tag = clean_html(match.group(2)).strip()
-                if tag and len(tag) < 50:
-                    tags.add(tag)
+        # HTML 结构示例:
+        # <div class="single-video-tag" ...><a ...><span>#</span>&nbsp;绝区零</a></div>
+        # <div class="single-video-tag" ...><a ...>无码&nbsp;<span>(1)</span></a></div>
+        
+        # 正则逻辑：
+        # 1. 找到 class="single-video-tag" 的 div
+        # 2. 提取里面 <a> 标签包裹的所有内容 (group 1)
+        tag_pattern = r'class="single-video-tag"[^>]*>.*?<a[^>]*>(.*?)</a>'
+        
+        for match in re.finditer(tag_pattern, self._html_content, re.DOTALL | re.IGNORECASE):
+            raw_content = match.group(1)
             
-            # 匹配 class="tag" 模式
-            tag_pattern = r'<[^>]+class="[^"]*tag[^"]*"[^>]*>([^<]+)</[^>]+>'
-            for match in re.finditer(tag_pattern, self._html_content, re.IGNORECASE):
-                tag = clean_html(match.group(1)).strip()
-                # 排除数字和过短的标签
-                if tag and len(tag) > 1 and len(tag) < 50 and not tag.isdigit():
-                    tags.add(tag)
-        
-        return list(tags)
+            # 数据清洗步骤：
+            
+            # 第一步：移除所有 <span>...</span> 标签及其内容
+            # 这会把 <span>#</span> 和 <span>(1)</span> 全部删掉
+            cleaned_content = re.sub(r'<span[^>]*>.*?</span>', '', raw_content, flags=re.DOTALL | re.IGNORECASE)
+            
+            # 第二步：使用 clean_html 清理 &nbsp; 和其他 HTML 实体
+            tag_text = clean_html(cleaned_content).strip()
+            
+            # 第三步：有效性检查
+            if tag_text and len(tag_text) < 50:
+                tags.add(tag_text)
+
+        # 3. 清理黑名单
+        blacklist = {'Hanime1', 'H動漫', '線上看', '免費', '1080p', 'HD', '登入', '註冊'}
+        final_tags = [t for t in tags if t not in blacklist]
+
+        # 排序并返回
+        return sorted(list(final_tags))
+
+
     
     def _extract_video_url(self) -> str:
-        """提取视频源URL"""
-        # 尝试提取m3u8
-        match = REGEX_VIDEO_SOURCE.search(self._html_content)
-        if match:
-            return match.group(1)
+        """提取视频源URL (终极版：支持 m3u8/mp4，自动修复转义和 &amp;)"""
+        # 引入 html 库用于解码 &amp;
+        import html
         
-        match = REGEX_VIDEO_SOURCE_ALT.search(self._html_content)
-        if match:
-            return match.group(0)
+        if not self._html_content:
+            return ""
+
+        # --- 阶段 1: 暴力提取 (针对 JS 变量中的链接) ---
         
-        # 尝试提取mp4
-        match = REGEX_VIDEO_MP4.search(self._html_content)
-        if match:
-            return match.group(0)
+        # 定义要查找的扩展名和对应的正则模式
+        # 优先找 m3u8，其次找 mp4
+        targets = [
+            ('.m3u8', [
+                r'"(https?://[^"]+\.m3u8[^"]*)"',      # 双引号
+                r'\'(https?://[^\']+\.m3u8[^\']*)\'',  # 单引号
+                r'url:\s*"(https?://[^"]+\.m3u8[^"]*)"' # JS属性
+            ]),
+            ('.mp4', [
+                r'"(https?://[^"]+\.mp4[^"]*)"',
+                r'\'(https?://[^\']+\.mp4[^\']*)\''
+            ])
+        ]
+
+        for ext, patterns in targets:
+            for pattern in patterns:
+                for match in re.finditer(pattern, self._html_content):
+                    url = match.group(1)
+                    
+                    # 步骤1：处理 Unicode 转义 (如 \u002F)
+                    try:
+                        url = url.encode('utf-8').decode('unicode_escape')
+                    except:
+                        pass
+                    
+                    # 步骤2：处理反斜杠转义 (如 \/ -> /)
+                    url = url.replace(r'\/', '/')
+                    
+                    # 步骤3：处理 HTML 实体 (关键！把 &amp; 变回 &)
+                    url = html.unescape(url)
+                    
+                    # 简单的有效性检查
+                    if url.startswith('http'):
+                        return url
+
+        # --- 阶段 2: 使用 consts.py 中的正则 (保底逻辑) ---
         
+        try:
+            from .consts import (
+                REGEX_VIDEO_SOURCE, 
+                REGEX_VIDEO_SOURCE_ALT, 
+                REGEX_VIDEO_MP4
+            )
+            
+            # 辅助函数：统一清理 URL
+            def clean_url(u):
+                if not u: return ""
+                u = u.replace(r'\/', '/')
+                return html.unescape(u)
+
+            # 尝试标准 m3u8 匹配
+            match = REGEX_VIDEO_SOURCE.search(self._html_content)
+            if match:
+                return clean_url(match.group(1))
+            
+            match = REGEX_VIDEO_SOURCE_ALT.search(self._html_content)
+            if match:
+                return clean_url(match.group(0))
+                
+            # 尝试标准 mp4 匹配
+            match = REGEX_VIDEO_MP4.search(self._html_content)
+            if match:
+                return clean_url(match.group(0))
+                
+        except ImportError:
+            pass
+
         return ""
+
+
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""

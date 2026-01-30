@@ -229,6 +229,7 @@ class HanimeClient:
         self, 
         query: str = "",
         genre: str = "",
+        tags: Optional[List[str]] = None,  # 新增 tags 参数
         sort: str = "latest",
         page: int = 1,
         limit: int = 20
@@ -239,6 +240,7 @@ class HanimeClient:
         Args:
             query: 搜索关键词
             genre: 分类/类型
+            tags: 标签
             sort: 排序方式 (latest/views/likes)
             page: 页码
             limit: 最大返回数量
@@ -251,6 +253,14 @@ class HanimeClient:
             params.append(f"query={query}")
         if genre:
             params.append(f"genre={genre}")
+        
+        # --- 新增：处理标签参数 ---
+        if tags:
+            for tag in tags:
+                # 构造 tags[]=标签名
+                params.append(f"tags[]={tag}")
+        # ------------------------
+
         if sort and sort != "latest":
             params.append(f"sort={sort}")
         if page > 1:
@@ -258,11 +268,15 @@ class HanimeClient:
         
         url = f"{SEARCH_URL}?{'&'.join(params)}" if params else BASE_URL
         
+        # 调试日志，方便你看 URL 对不对
+        logger.debug(f"[Hanime] Search URL: {url}")
+        
         html = await self._fetch(url)
         if not html:
             return []
         
         return self._parse_video_list(html, limit)
+
     
     async def get_by_genre(
         self,
@@ -282,7 +296,18 @@ class HanimeClient:
             VideoPreview列表
         """
         return await self.search(genre=genre, page=page, limit=limit)
-    
+
+    async def get_by_tags(
+        self,
+        tags: List[str],  # 接收列表
+        page: int = 1,
+        limit: int = 20
+    ) -> List[VideoPreview]:
+        """
+        按多个标签获取视频 (tags[]=a&tags[]=b)
+        """
+        return await self.search(tags=tags, page=page, limit=limit)
+        
     def _parse_embedded_json(self, html: str, limit: int) -> List[VideoPreview]:
         """
         从页面嵌入的 JSON 数据中提取视频信息
@@ -365,65 +390,73 @@ class HanimeClient:
     
     def _parse_video_list(self, html: str, limit: int) -> List[VideoPreview]:
         """
-        解析视频列表HTML
-        
-        Args:
-            html: HTML内容
-            limit: 最大返回数量
-            
-        Returns:
-            VideoPreview列表
+        解析视频列表HTML (分块搜索版，修复错位且保证能搜到)
         """
-        results = []
-        seen_ids = set()
+        results = {}
         
-        # 输出调试信息
-        logger.debug(f"[Hanime] HTML length: {len(html)}")
+        # 1. 查找所有视频链接的位置
+        # 匹配: href="...watch?v=123..." (兼容相对路径和绝对路径)
+        # 使用 finditer 获取所有匹配对象，以便知道它们在字符串中的位置
+        pattern = re.compile(r'href="[^"]*watch\?v=(\d+)"')
+        matches = list(pattern.finditer(html))
         
-        # 方法1: 使用简单正则提取所有视频ID
-        video_ids = []
-        for match in REGEX_VIDEO_CARD_SIMPLE.finditer(html):
-            vid = match.group(2)
-            if vid and vid not in seen_ids:
-                seen_ids.add(vid)
-                video_ids.append(vid)
-        
-        logger.debug(f"[Hanime] Found {len(video_ids)} video IDs with simple regex")
-        
-        # 方法1.5: 尝试更多的正则模式
-        if not video_ids:
-            # 尝试匹配 data-video-id 属性
-            for match in re.finditer(r'data-video-id="(\d+)"', html):
-                vid = match.group(1)
-                if vid and vid not in seen_ids:
-                    seen_ids.add(vid)
-                    video_ids.append(vid)
+        for i, match in enumerate(matches):
+            vid = match.group(1)
             
-            # 尝试匹配 /watch?v= 的各种变体
-            for match in re.finditer(r'/watch\?v=(\d+)', html):
-                vid = match.group(1)
-                if vid and vid not in seen_ids:
-                    seen_ids.add(vid)
-                    video_ids.append(vid)
+            # 如果这个ID已经提取过，跳过 (Hanime列表页通常图片和标题各有一个链接，指向同一个ID)
+            if vid in results:
+                continue
+                
+            # --- 关键逻辑：确定当前视频的搜索范围 ---
+            # 起始点：当前链接之后
+            start_pos = match.end()
             
-            logger.debug(f"[Hanime] Found {len(video_ids)} video IDs with extended regex")
-        
-        # 为每个ID创建预览对象
-        for vid in video_ids[:limit]:
+            # 结束点：下一个视频链接的开始 (或者HTML结束)
+            # 这样我们就把搜索限制在两个视频ID之间，绝对不会跨界！
+            if i < len(matches) - 1:
+                end_pos = matches[i+1].start()
+            else:
+                end_pos = len(html)
+            
+            # 截取这段 HTML
+            # 限制最大长度 3000 字符，防止两个视频隔得太远导致性能问题
+            chunk = html[start_pos : min(end_pos, start_pos + 3000)]
+            
+            # 初始化预览对象
             preview = VideoPreview(video_id=vid)
             
-            # 尝试提取额外信息
-            preview.thumbnail = self._extract_thumbnail_for_id(html, vid)
-            preview.title = self._extract_title_for_id(html, vid)
+            # --- 在这个片段(chunk)里找标题和封面 ---
             
-            results.append(preview)
+            # 1. 找图片 Alt (通常是最准确的中文标题)
+            # 匹配 <img ... alt="标题">
+            img_match = re.search(r'<img[^>]+alt="([^"]+)"', chunk, re.IGNORECASE)
+            if img_match:
+                title = clean_html(img_match.group(1)).strip()
+                if title and "user" not in title.lower():
+                    preview.title = title
+            
+            # 2. 找 Div Title (备用)
+            # 匹配 class="...title..." >标题<
+            if not preview.title:
+                title_match = re.search(r'class="[^"]*title[^"]*"[^>]*>([^<]+)<', chunk, re.IGNORECASE)
+                if title_match:
+                    preview.title = clean_html(title_match.group(1)).strip()
+            
+            # 3. 找缩略图
+            # 匹配 src="..." 或 data-src="..."
+            if not preview.thumbnail:
+                thumb_match = re.search(r'(?:src|data-src)="([^"]+)"', chunk, re.IGNORECASE)
+                if thumb_match:
+                    preview.thumbnail = thumb_match.group(1)
+            
+            results[vid] = preview
+            
+        # 转换为列表
+        final_list = list(results.values())
+        logger.info(f"[Hanime] Parsed {len(final_list)} videos using chunk strategy.")
         
-        # 如果方法1没有结果，尝试方法2
-        if not results:
-            logger.debug("[Hanime] Trying advanced parsing...")
-            results = self._parse_video_cards_advanced(html, limit)
-        
-        return results[:limit]
+        return final_list[:limit]
+
     
     def _extract_thumbnail_for_id(self, html: str, video_id: str) -> str:
         """提取指定视频ID的缩略图"""
@@ -446,14 +479,49 @@ class HanimeClient:
         return ""
     
     def _extract_title_for_id(self, html: str, video_id: str) -> str:
-        """提取指定视频ID的标题"""
+        """提取指定视频ID的标题 (增强版)"""
+        # 定义搜索范围窗口大小 (字符数)，避免匹配到太远的地方
+        # 我们截取视频ID附近的一段HTML来分析，而不是在整个HTML里乱找
+        search_window = 1000
+        
+        # 找到视频ID在HTML中的所有位置
+        start_positions = [m.start() for m in re.finditer(re.escape(video_id), html)]
+        
+        for pos in start_positions:
+            # 截取 ID 附近的内容 (前后各扩一段)
+            start = max(0, pos - search_window)
+            end = min(len(html), pos + search_window)
+            chunk = html[start:end]
+            
+            # 在片段中尝试匹配标题
+            # 1. 匹配图片 alt 属性 (通常是最准确的标题)
+            # 格式: <img ... alt="标题" ...>
+            img_alt_matches = re.findall(r'<img[^>]+alt="([^"]+)"', chunk)
+            for title in img_alt_matches:
+                title = clean_html(title).strip()
+                # 过滤掉非标题的 alt (如 "User")
+                if title and len(title) > 2 and "user" not in title.lower():
+                    return title
+
+            # 2. 匹配 class="card-mobile-title" 或类似结构
+            title_div_matches = re.findall(r'class="[^"]*title[^"]*"[^>]*>([^<]+)<', chunk)
+            for title in title_div_matches:
+                title = clean_html(title).strip()
+                if title and len(title) > 2:
+                    return title
+
+            # 3. 匹配 title 属性
+            title_attr_matches = re.findall(r'title="([^"]+)"', chunk)
+            for title in title_attr_matches:
+                title = clean_html(title).strip()
+                if title and len(title) > 2:
+                    return title
+
+        # 如果上面的局部搜索失败，尝试全局旧正则 (保底)
         patterns = [
-            # 链接后的标题元素
-            rf'href="/watch\?v={video_id}"[^>]*>.*?<[^>]*class="[^"]*(?:title|card-mobile-title|home-rows-videos-title)[^"]*"[^>]*>([^<]+)<',
-            # 链接文本作为标题
-            rf'<a[^>]+href="/watch\?v={video_id}"[^>]*title="([^"]+)"',
-            # alt属性
-            rf'href="/watch\?v={video_id}".*?alt="([^"]+)"',
+            rf'href="/watch\?v={video_id}"[^>]*>.*?<img[^>]+alt="([^"]+)"',
+            rf'<img[^>]+alt="([^"]+)"[^>]*>.*?href="/watch\?v={video_id}"',
+            rf'href="/watch\?v={video_id}"[^>]*>.*?<[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)<',
         ]
         
         for pattern in patterns:
@@ -464,6 +532,7 @@ class HanimeClient:
                     return title
         
         return ""
+
     
     def _parse_video_cards_advanced(self, html: str, limit: int) -> List[VideoPreview]:
         """
